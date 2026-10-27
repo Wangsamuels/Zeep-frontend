@@ -14,13 +14,8 @@ export function zeepFetch(network: Network): typeof fetch {
   let f = cache.get(network);
   if (!f) {
     const keyConfig = config.ohttpKey[network];
-    const baseUrl = apiBase(network);
-    if (!baseUrl) {
-      const name = network === "mainnet" ? "NEXT_PUBLIC_API_BASE_URL_MAINNET" : "NEXT_PUBLIC_API_BASE_URL_TESTNET";
-      throw new Error(`This build is missing its API address (${name}).`);
-    }
     if (!keyConfig) throw new Error("This build is missing its privacy key (NEXT_PUBLIC_OHTTP_KEY_CONFIG).");
-    const inner = ohttpFetch({ baseUrl, keyConfig });
+    const inner = ohttpFetch({ baseUrl: apiBase(network), keyConfig });
     f = (async (input, init) => {
       const response = await inner(input, init);
       if (response.ok) return response;

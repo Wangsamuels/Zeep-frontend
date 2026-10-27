@@ -26,7 +26,6 @@ export type VaultView = {
   zecValueLabel: string;
   microPerCredit: number;
   prices: PriceSheet | null;
-  pricesError: string | null;
 };
 
 const VaultContext = createContext<{
@@ -51,7 +50,6 @@ function blank(network: Network): VaultView {
     zecValueLabel: "…",
     microPerCredit: 1_000_000,
     prices: null,
-    pricesError: null,
   };
 }
 
@@ -76,7 +74,6 @@ function fromSession(network: Network): VaultView {
     zecValueLabel: prices ? formatUsd(zatsToMicroUsd(session.zecZats, zecUsd)) : "…",
     microPerCredit: per,
     prices,
-    pricesError: session.pricesError ?? null,
   };
 }
 
@@ -127,17 +124,11 @@ export function VaultState({ children }: { children: ReactNode }) {
         const current = readSession();
         if (!current) return;
         current.prices = prices;
-        current.pricesError = null;
         emit();
         window.clearInterval(timer);
         const sec = Math.min(60, Math.max(30, prices.refresh_sec ?? 60));
         timer = window.setInterval(pull, sec * 1000);
-      }).catch((cause) => {
-        const current = readSession();
-        if (!current) return;
-        current.pricesError = cause instanceof Error ? cause.message : "Prices are unavailable.";
-        emit();
-      });
+      }).catch(() => {});
     };
     pull();
     return () => window.clearInterval(timer);
