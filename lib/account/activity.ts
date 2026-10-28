@@ -40,6 +40,7 @@ export function spendTitle(path: string): string {
   if (path.startsWith("/v1/research")) return "Research";
   if (path.startsWith("/v1/health")) return "Health";
   if (path.startsWith("/v1/inbox")) return "Inbox";
+  if (path.startsWith("/v1/email")) return "Email";
   return "Payment";
 }
 

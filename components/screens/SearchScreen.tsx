@@ -7,6 +7,7 @@ import { formatCredits } from "@/lib/zeep";
 import { isFundsError, payJson, requestError } from "@/lib/zeep/pay";
 import { readSession } from "@/lib/vault/session";
 import { Button } from "@/components/Button";
+import { MarkdownText } from "@/components/find/MarkdownText";
 import { QueryBar, ResultList } from "@/components/find/QueryBar";
 import { Toggle, type ToggleOption } from "@/components/ui/Toggle";
 import { useForge } from "@/lib/fx/useForge";
@@ -23,10 +24,31 @@ const LEVELS: { id: Level; label: string; route: `research_${Level}` }[] = [
   { id: "pro", label: "Pro", route: "research_pro" },
 ];
 
-function resultText(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result && typeof result === "object" && "content" in result && typeof result.content === "string") return result.content;
-  return JSON.stringify(result, null, 2);
+type Citation = { title: string; url?: string };
+
+function citationOf(item: unknown): Citation | null {
+  if (typeof item === "string") return /^https?:\/\//.test(item) ? { title: item, url: item } : { title: item };
+  if (!item || typeof item !== "object") return null;
+  const row = item as { title?: unknown; url?: unknown; text?: unknown };
+  const url = typeof row.url === "string" && /^https?:\/\//.test(row.url) ? row.url : undefined;
+  const title = typeof row.title === "string" ? row.title : typeof row.text === "string" ? row.text : url;
+  if (!title) return null;
+  return { title, url };
+}
+
+function researchView(result: unknown): { text: string; citations: Citation[] } {
+  if (typeof result === "string") return { text: result, citations: [] };
+  if (result && typeof result === "object" && "content" in result && typeof result.content === "string") {
+    const raw = (result as { content: string; citations?: unknown }).citations;
+    const citations = Array.isArray(raw)
+      ? raw.flatMap((item) => {
+          const citation = citationOf(item);
+          return citation ? [citation] : [];
+        })
+      : [];
+    return { text: result.content, citations };
+  }
+  return { text: JSON.stringify(result, null, 2), citations: [] };
 }
 
 export function SearchScreen() {
@@ -37,6 +59,7 @@ export function SearchScreen() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [researchStatus, setResearchStatus] = useState("");
   const [researchText, setResearchText] = useState("");
+  const [citations, setCitations] = useState<Citation[]>([]);
   const [busy, setBusy] = useState<"search" | "research" | null>(null);
   const [error, setError] = useState("");
   const [funds, setFunds] = useState(false);
@@ -76,23 +99,34 @@ export function SearchScreen() {
 
   useEffect(() => {
     if (!jobId || researchStatus === "completed" || researchStatus === "failed") return;
-    const timer = window.setInterval(() => {
+    let stop = false;
+    const pull = () => {
       void zeepFetch(view.network)(`${apiBase(view.network)}/v1/jobs/${jobId}`)
         .then(async (response) => {
           if (!response.ok) throw new Error(`The research job returned ${response.status}.`);
           return response.json() as Promise<{ status?: string; result?: unknown }>;
         })
         .then((body) => {
+          if (stop) return;
           const status = body.status ?? "running";
           setResearchStatus(status);
-          if (status === "completed") setResearchText(resultText(body.result));
+          if (status === "completed") {
+            const answer = researchView(body.result);
+            setResearchText(answer.text);
+            setCitations(answer.citations);
+          }
           if (status === "failed") setError("The research job failed.");
         })
         .catch((cause: unknown) => {
-          setError(cause instanceof Error ? cause.message : "The research job did not load.");
+          if (!stop) setError(cause instanceof Error ? cause.message : "The research job did not load.");
         });
-    }, 4000);
-    return () => window.clearInterval(timer);
+    };
+    pull();
+    const timer = window.setInterval(pull, 4000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
   }, [jobId, researchStatus, view.network]);
 
   async function research() {
@@ -102,6 +136,7 @@ export function SearchScreen() {
     setError("");
     setFunds(false);
     setResearchText("");
+    setCitations([]);
     setJobId(null);
     setResearchStatus("running");
     try {
@@ -139,7 +174,20 @@ export function SearchScreen() {
         {researchStatus === "running" ? <p className="mt-4 text-[13px] text-muted">Research is running…</p> : null}
         {error ? <p className="mt-4 text-[13px] text-danger">{error}</p> : null}
         {funds ? <Button href="/wallet?action=deposit" variant="secondary" className="mt-4">Add funds</Button> : null}
-        {researchText ? <p className="mt-8 max-w-2xl whitespace-pre-wrap text-[15px] leading-relaxed text-text">{researchText}</p> : null}
+        {researchText ? <MarkdownText text={researchText} /> : null}
+        {citations.length ? (
+          <ul className="mt-4 grid gap-1 text-[13px]">
+            {citations.map((item) => (
+              <li key={item.url ?? item.title}>
+                {item.url ? (
+                  <a href={item.url} target="_blank" rel="noreferrer" className="text-muted underline decoration-line-strong underline-offset-2 hover:text-gold">{item.title}</a>
+                ) : (
+                  <span className="text-muted">{item.title}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : null}
         <ResultList items={hits.map((hit) => ({ title: hit.title || hit.url || "Result", url: hit.url, snippet: hit.snippet }))} />
       </div>
     </Page>

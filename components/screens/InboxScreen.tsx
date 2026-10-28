@@ -13,6 +13,7 @@ import { Button } from "@/components/Button";
 import { TextField } from "@/components/Panel";
 import { useVault } from "@/components/Providers";
 import { ProofButton } from "@/components/ui/ProofButton";
+import { Toggle } from "@/components/ui/Toggle";
 import { useForge } from "@/lib/fx/useForge";
 
 const ADDRESS = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
@@ -35,6 +36,17 @@ function sendError(cause: unknown): string {
     if (cause.status === 429 || cause.code === "rate_limited") return "Daily sending limit reached, try again tomorrow";
     if (cause.status === 400) return cause.message;
   }
+  if (isFundsError(cause)) return cause instanceof Error ? cause.message : "This balance cannot cover that request.";
+  return cause instanceof Error ? cause.message : "The message did not send.";
+}
+
+function directSendError(cause: unknown): string {
+  if (cause instanceof ZeepApiError && cause.code === "daily_limit") return requestError(cause, "The message did not send.");
+  if (cause instanceof ZeepApiError && (cause.status === 429 || cause.code === "rate_limited")) {
+    return "Send-only email is busy today; try again tomorrow, or send from your own address.";
+  }
+  if (cause instanceof ZeepApiError && (cause.status === 503 || cause.code === "unavailable")) return "Couldn't send right now. You were not charged.";
+  if (cause instanceof ZeepApiError && cause.status === 400) return cause.message;
   if (isFundsError(cause)) return cause instanceof Error ? cause.message : "This balance cannot cover that request.";
   return cause instanceof Error ? cause.message : "The message did not send.";
 }
@@ -95,14 +107,18 @@ export function InboxScreen() {
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
   const [replyAll, setReplyAll] = useState(false);
+  const [fromShared, setFromShared] = useState(false);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [funds, setFunds] = useState(false);
   const [copied, setCopied] = useState(false);
   const forge = useForge();
   const openPrice = view.prices?.routes.inbox?.micro_usd;
-  const sendPrice = view.prices?.routes.inbox_send?.micro_usd;
-  const openLabel = openPrice === undefined ? "Open an inbox" : `Open an inbox · ${formatCredits(openPrice, view.microPerCredit)} cr`;
+  const ownSendPrice = view.prices?.routes.inbox_send?.micro_usd;
+  const directPrice = view.prices?.routes.email_send?.micro_usd;
+  const shared = !view.inboxAddress || (mode === "compose" && fromShared);
+  const sendPrice = shared ? directPrice : ownSendPrice;
+  const ownAddressLabel = openPrice === undefined ? "Get your own address to receive replies" : `Get your own address (${formatCredits(openPrice, view.microPerCredit)} cr) to receive replies`;
   const sendLabel = sendPrice === undefined ? "Send" : `Send · ${formatCredits(sendPrice, view.microPerCredit)} cr`;
 
   const refresh = useCallback(async () => {
@@ -127,7 +143,8 @@ export function InboxScreen() {
     setCursor(null);
     setOpenId(null);
     setLetter(null);
-    setMode("read");
+    setMode(view.inboxId ? "read" : "compose");
+    setFromShared(!view.inboxId);
   }, [view.inboxId]);
 
   useEffect(() => {
@@ -151,7 +168,9 @@ export function InboxScreen() {
       void rememberSpend(session.network, "/v1/inbox", BigInt(openPrice));
     } catch (cause) {
       setFunds(isFundsError(cause));
-      setError(requestError(cause, "The inbox did not open."));
+      if (cause instanceof ZeepApiError && (cause.status === 503 || cause.code === "unavailable")) {
+        setError("Addresses are temporarily unavailable. You were not charged. You can still send email.");
+      } else setError(requestError(cause, "The inbox did not open."));
     } finally {
       setBusy("");
     }
@@ -222,39 +241,60 @@ export function InboxScreen() {
   async function send() {
     const session = readSession();
     const inboxId = session?.record.inboxId;
-    if (!session || !inboxId || sendPrice === undefined) return;
+    if (!session || sendPrice === undefined) return;
     const problem = mode === "compose" ? recipientError(to, cc) : "";
     if (problem) {
       setError(problem);
+      return;
+    }
+    if (shared && !subject.trim()) {
+      setError("Add a subject.");
       return;
     }
     if (!body.trim()) {
       setError("Write a message.");
       return;
     }
+    if (!shared && !inboxId) return;
     setError("");
     setFunds(false);
     setBusy("Sending…");
     try {
-      if (mode === "reply" && openId) {
+      if (shared) {
+        await forge.track(() => session.client.sendEmailDirect({
+          to: recipients(to),
+          cc: recipients(cc).length ? recipients(cc) : undefined,
+          subject,
+          text: body,
+          replyInboxId: inboxId ?? undefined,
+        }));
+        void rememberSpend(session.network, "/v1/email/send", BigInt(sendPrice));
+      } else if (mode === "reply" && openId && inboxId) {
         await forge.track(() => session.client.replyEmail(inboxId, openId, { text: body, replyAll }));
-      } else {
+        void rememberSpend(session.network, "/v1/inbox/send", BigInt(sendPrice));
+      } else if (inboxId) {
         await forge.track(() => session.client.sendEmail(inboxId, {
           to: recipients(to),
           cc: recipients(cc).length ? recipients(cc) : undefined,
           subject,
           text: body,
         }));
+        void rememberSpend(session.network, "/v1/inbox/send", BigInt(sendPrice));
       }
-      void rememberSpend(session.network, "/v1/inbox/send", BigInt(sendPrice));
       setBody("");
-      setMode("read");
-      await refresh();
+      if (inboxId) {
+        setMode("read");
+        await refresh();
+      } else {
+        setTo("");
+        setCc("");
+        setSubject("");
+      }
     } catch (cause) {
       if (gone(cause)) await clearInbox();
       else {
         setFunds(isFundsError(cause));
-        setError(sendError(cause));
+        setError(shared ? directSendError(cause) : sendError(cause));
       }
     } finally {
       setBusy("");
@@ -283,21 +323,7 @@ export function InboxScreen() {
     }
   }
 
-  if (!view.inboxAddress) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-16 text-center">
-        <h1 className="text-[32px] font-semibold tracking-[-0.025em]">Inbox</h1>
-        <p className="mt-3 max-w-md text-[15px] leading-relaxed text-muted">An address with no name on it. Opening it takes one proof. Reading is free.</p>
-        <div className="mt-6">
-          <ProofButton phase={forge.phase} label={openLabel} settledLabel="Opened" disabled={Boolean(busy) || openPrice === undefined} onClick={() => void create()} />
-        </div>
-        {error ? <p className="mt-3 text-[13px] text-danger">{error}</p> : null}
-        {funds ? <Button href="/wallet?action=deposit" variant="secondary" className="mt-3">Add funds</Button> : null}
-      </div>
-    );
-  }
-
-  const showing = mode === "compose" || mode === "reply" || Boolean(letter);
+  const showing = mode === "compose" || mode === "reply" || Boolean(letter) || !view.inboxAddress;
   const html = letter?.html ? quietHtml(letter.html, images) : "";
 
   return (
@@ -306,18 +332,29 @@ export function InboxScreen() {
         <aside className={cx("flex min-h-0 w-full flex-col md:w-[320px] md:border-r md:border-line", showing ? "hidden md:flex" : "flex")}>
           <div className="flex items-center gap-2 border-b border-line px-3 py-2.5">
             <div className="min-w-0 flex-1">
-              <p className="truncate font-mono text-[12px] text-text">{view.inboxAddress}</p>
-              {expires ? <p className="truncate text-[11px] text-faint">{expiryLabel(expires)}</p> : null}
+              {view.inboxAddress ? (
+                <>
+                  <p className="truncate font-mono text-[12px] text-text">{view.inboxAddress}</p>
+                  {expires ? <p className="truncate text-[11px] text-faint">{expiryLabel(expires)}</p> : null}
+                </>
+              ) : (
+                <>
+                  <p className="truncate text-[13px] text-text">Inbox</p>
+                  <p className="truncate text-[11px] text-faint">Mail has nowhere to arrive.</p>
+                </>
+              )}
             </div>
-            <Button variant="ghost" size="sm" onClick={() => void copyText(view.inboxAddress ?? "").then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>
-              {copied ? "Copied" : "Copy"}
-            </Button>
-            <Button variant="ghost" size="sm" disabled={Boolean(busy)} onClick={() => void refresh()}>Refresh</Button>
-            <Button variant="ghost" size="sm" onClick={compose}>New</Button>
+            {view.inboxAddress ? (
+              <Button variant="ghost" size="sm" onClick={() => void copyText(view.inboxAddress ?? "").then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>
+                {copied ? "Copied" : "Copy"}
+              </Button>
+            ) : null}
+            {view.inboxAddress ? <Button variant="ghost" size="sm" disabled={Boolean(busy)} onClick={() => void refresh()}>Refresh</Button> : null}
+            {view.inboxAddress ? <Button variant="ghost" size="sm" onClick={compose}>New</Button> : null}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
             {messages.length === 0 ? (
-              <p className="px-3 py-8 text-center text-[13px] text-faint">No messages yet.</p>
+              <p className="px-3 py-8 text-center text-[13px] text-faint">{view.inboxAddress ? "No messages yet." : "No messages. There is no address for mail to arrive at."}</p>
             ) : (
               <ul>
                 {messages.map((item) => (
@@ -346,7 +383,7 @@ export function InboxScreen() {
           </div>
         </aside>
         <section className={cx("min-h-0 flex-1 flex-col", showing ? "flex" : "hidden md:flex")}>
-          {mode === "compose" || mode === "reply" ? (
+          {mode === "compose" || mode === "reply" || !view.inboxAddress ? (
             <form
               className="flex min-h-0 flex-1 flex-col"
               onSubmit={(event) => {
@@ -355,21 +392,33 @@ export function InboxScreen() {
               }}
             >
               <div className="flex items-center gap-2 border-b border-line px-4 py-2.5">
-                <Button variant="ghost" size="sm" className="md:hidden" onClick={() => { setMode("read"); if (!letter) setOpenId(null); }}>Back</Button>
+                {view.inboxAddress ? <Button variant="ghost" size="sm" className="md:hidden" onClick={() => { setMode("read"); if (!letter) setOpenId(null); }}>Back</Button> : null}
                 <h1 className="min-w-0 flex-1 truncate text-[16px] font-medium">{mode === "reply" ? "Reply" : "New message"}</h1>
               </div>
               <div className="grid min-h-0 flex-1 gap-3 overflow-y-auto px-4 py-4">
-                {mode === "compose" ? (
+                {mode === "compose" && view.inboxAddress ? (
+                  <Toggle
+                    label="Send from"
+                    size="sm"
+                    value={fromShared ? "shared" : "own"}
+                    onChange={(value) => setFromShared(value === "shared")}
+                    options={[
+                      { value: "own", label: "Your address" },
+                      { value: "shared", label: "Shared address" },
+                    ]}
+                  />
+                ) : null}
+                {mode === "reply" ? (
+                  <label className="flex items-center gap-2 text-[13px] text-muted">
+                    <input type="checkbox" checked={replyAll} onChange={(event) => setReplyAll(event.target.checked)} />
+                    Reply all
+                  </label>
+                ) : (
                   <>
                     <TextField label="To" value={to} onChange={setTo} placeholder="name@example.com" />
                     <TextField label="Cc" value={cc} onChange={setCc} placeholder="Optional" />
                     <TextField label="Subject" value={subject} onChange={setSubject} />
                   </>
-                ) : (
-                  <label className="flex items-center gap-2 text-[13px] text-muted">
-                    <input type="checkbox" checked={replyAll} onChange={(event) => setReplyAll(event.target.checked)} />
-                    Reply all
-                  </label>
                 )}
                 <label className="grid gap-1.5 text-[13px] text-muted">
                   Body
@@ -387,9 +436,17 @@ export function InboxScreen() {
                 ) : null}
                 {error ? <p className="text-[13px] text-danger">{error}</p> : null}
                 {funds ? <Button href="/wallet?action=deposit" variant="secondary">Add funds</Button> : null}
-                <div>
+                <div className="flex flex-wrap items-center gap-3">
                   <ProofButton type="submit" phase={forge.phase} label={sendLabel} settledLabel="Sent" disabled={Boolean(busy) || sendPrice === undefined} />
                 </div>
+                {!view.inboxAddress ? (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <p className="text-[13px] text-muted">Sent from a shared Zeep address. Recipients can't reply unless you have your own address.</p>
+                    <Button variant="secondary" size="sm" disabled={Boolean(busy) || openPrice === undefined} onClick={() => void create()}>
+                      {busy === "Opening…" ? "Opening…" : ownAddressLabel}
+                    </Button>
+                  </div>
+                ) : null}
               </div>
             </form>
           ) : letter ? (
